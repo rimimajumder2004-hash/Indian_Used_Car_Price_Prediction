@@ -53,31 +53,58 @@ class CarPriceModel:
         return [c for c in df.columns if c not in exclude and self._is_non_numeric(df[c])]
 
     def _detect_target(self, df):
+        # First pass: keyword match on numeric columns
         for kw in self.PRICE_KEYWORDS:
             col = self._find_col(df, [kw])
             if col and pd.api.types.is_numeric_dtype(df[col]):
                 return col
-        # Fallback: numeric column with highest mean (excluding Id)
-        num_cols = [c for c in df.select_dtypes(include=np.number).columns
-                    if c.lower() != "id"]
+        # Second pass: keyword match even if column is object dtype
+        # (handles case where currency cleaning wasn't applied yet)
+        for kw in self.PRICE_KEYWORDS:
+            col = self._find_col(df, [kw])
+            if col:
+                return col
+        # Fallback: numeric column with highest mean, explicitly excluding
+        # year-like columns (values between 1900-2100) and Id
+        num_cols = [
+            c for c in df.select_dtypes(include=np.number).columns
+            if c.lower() not in ("id",)
+            and not any(kw in c.lower() for kw in self.YEAR_KEYWORDS)
+            and not (df[c].dropna().between(1900, 2100).all() and df[c].nunique() < 50)
+        ]
         if num_cols:
             return max(num_cols, key=lambda c: df[c].mean())
         return None
 
     # ─── Currency Cleaning ───────────────────────────────────────────
     def _clean_currency_cols(self, df):
-        """Detect columns with ₹ / currency strings and convert to numeric lakhs."""
+        """Detect columns with ₹ / currency strings and convert to numeric lakhs.
+        Handles Windows encoding issues where ₹ may appear as garbled bytes."""
         df = df.copy()
         for col in df.columns:
             if df[col].dtype == object:
                 sample = df[col].dropna().astype(str).head(20)
-                if sample.str.contains(r"[₹,]", regex=True).any():
+                # Match ₹ literally, its common mis-encodings (â‚¹), Rs prefix, or comma-numbers
+                has_currency = (
+                    sample.str.contains(r"[\u20b9\â‚¹,]", regex=True).any()
+                    or sample.str.contains(r"Rs\.?\s*\d", regex=True).any()
+                    or sample.str.contains(r"^\s*[\d,]+\s*$", regex=True).any()
+                )
+                if has_currency:
                     cleaned = (
                         df[col].astype(str)
-                        .str.replace(r"[₹,\s]", "", regex=True)
+                        # Strip ₹ (U+20B9), mojibake variants, Rs prefix
+                        .str.replace(u"\u20b9", "", regex=False)
+                        .str.replace(r"â‚¹|Rs\.?", "", regex=True)
+                        # Strip commas and whitespace
+                        .str.replace(r"[,\s]", "", regex=True)
                         .str.strip()
+                        # Remove any remaining non-numeric chars (keep dot/minus)
+                        .str.replace(r"[^\d.\-]", "", regex=True)
                     )
                     numeric = pd.to_numeric(cleaned, errors="coerce")
+                    if numeric.dropna().empty:
+                        continue
                     # Values > 1000 are raw rupees → convert to lakhs
                     if numeric.median() > 1000:
                         numeric = numeric / 1_00_000
@@ -149,8 +176,10 @@ class CarPriceModel:
             if self._is_non_numeric(df[col]):
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-        # Fill numeric nulls with median
+        # Fill numeric nulls with median (skip target to avoid distortion)
         for col in df.select_dtypes(include=np.number).columns:
+            if col == self.target_col:
+                continue
             if df[col].isnull().any():
                 df[col].fillna(df[col].median(), inplace=True)
 
@@ -206,8 +235,27 @@ class CarPriceModel:
             self.feature_info = self._build_feature_info(df)
             df_processed = self._preprocess(df, fit=True)
 
+            if self.target_col not in df_processed.columns:
+                return False, (
+                    f"Target column '{self.target_col}' was lost during preprocessing. "
+                    f"Available columns: {list(df_processed.columns)}"
+                )
+
             X = df_processed.drop(columns=[self.target_col], errors="ignore")
             y = df_processed[self.target_col]
+
+            # ── Final safety net: ensure target is truly numeric ────────
+            if not pd.api.types.is_numeric_dtype(y):
+                y = (
+                    y.astype(str)
+                    .str.replace(u"\u20b9", "", regex=False)   # ₹
+                    .str.replace(r"â‚¹|Rs\.?", "", regex=True)  # mojibake / Rs
+                    .str.replace(r"[,\s]", "", regex=True)
+                    .str.replace(r"[^\d.\-]", "", regex=True)
+                )
+                y = pd.to_numeric(y, errors="coerce")
+                if y.median() > 1000:
+                    y = y / 1_00_000
 
             mask = y.notna()
             X, y = X[mask], y[mask]

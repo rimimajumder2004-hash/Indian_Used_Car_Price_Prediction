@@ -26,13 +26,15 @@ def export_prediction_csv(predictions: list) -> bytes:
 # ─────────────────────────── PDF Export ───────────────────────────
 class PredictionPDF(FPDF):
     def header(self):
-        # Header bar
         self.set_fill_color(102, 126, 234)
         self.rect(0, 0, 210, 30, "F")
-        self.set_font("Helvetica", "B", 18)
+
+        self.set_font("Helvetica", "B", 16)  # slightly smaller font
         self.set_text_color(255, 255, 255)
-        self.cell(0, 15, "", ln=True)
-        self.cell(0, 12, "  India Used Car Price Prediction Report", ln=True)
+
+        self.ln(8)
+        self.multi_cell(0, 10, "India Used Car Price Prediction Report", align="C")
+
         self.set_text_color(0, 0, 0)
         self.ln(5)
 
@@ -99,4 +101,4 @@ def export_prediction_pdf(input_data: dict, price: float, low: float, high: floa
         "India used car data. Actual market prices may vary based on vehicle condition, location, "
         "negotiation, and market demand. This report is for informational purposes only.")
 
-    return pdf.output()
+    return bytes(pdf.output(dest='S').encode('latin-1'))
