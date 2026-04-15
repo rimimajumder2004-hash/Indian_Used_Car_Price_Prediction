@@ -79,9 +79,6 @@ st.markdown("""
         transform: translateY(-2px);
         box-shadow: 0 4px 15px rgba(102,126,234,0.4);
     }
-    .sidebar .stSelectbox label, .sidebar .stSlider label {
-        font-weight: 600;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -110,17 +107,49 @@ with st.sidebar:
             df = pd.read_csv(uploaded_file)
             st.session_state.df = df
             st.success(f"✅ {len(df):,} records loaded!")
-            st.markdown(f"**Columns:** {len(df.columns)}")
-            st.markdown(f"**Shape:** `{df.shape}`")
+            st.markdown(f"**Columns:** {len(df.columns)}  |  **Shape:** `{df.shape}`")
         except Exception as e:
             st.error(f"Error reading file: {e}")
 
     st.markdown("---")
+
     if st.session_state.df is not None:
+        df_sidebar = st.session_state.df
+
+        # ── Target column selector ──────────────────────────────────
+        st.markdown("## 🎯 Target Column")
+        all_cols = df_sidebar.columns.tolist()
+
+        # Suggest price-like columns at the top of the dropdown
+        price_hints = [c for c in all_cols if any(k in c.lower() for k in ["price", "cost", "value", "sell", "amount", "rate"])]
+        other_cols  = [c for c in all_cols if c not in price_hints]
+        ordered_cols = price_hints + other_cols
+
+        # Auto-select first price hint (if any), else first column
+        default_idx = 0
+
+        selected_target = st.selectbox(
+            "Select the **price / target** column",
+            ordered_cols,
+            index=default_idx,
+            help="This is the column the model will learn to predict. "
+                 "Choose the column that contains the car's selling price."
+        )
+
+        # Show a quick preview of the selected column's distribution
+        col_data = pd.to_numeric(df_sidebar[selected_target], errors="coerce").dropna()
+        if not col_data.empty:
+            st.caption(
+                f"Min: {col_data.min():,.0f}  |  "
+                f"Median: {col_data.median():,.0f}  |  "
+                f"Max: {col_data.max():,.0f}"
+            )
+
+        st.markdown("---")
         st.markdown("## ⚙️ Model Settings")
         n_estimators = st.slider("Number of Trees", 50, 500, 200, 50)
-        max_depth = st.select_slider("Max Depth", options=[3, 5, 7, 10, 15, 20, None], value=10)
-        test_size = st.slider("Test Split %", 10, 40, 20, 5)
+        max_depth    = st.select_slider("Max Depth", options=[3, 5, 7, 10, 15, 20, None], value=10)
+        test_size    = st.slider("Test Split %", 10, 40, 20, 5)
 
         if st.button("🚀 Train Model"):
             with st.spinner("Training Random Forest..."):
@@ -129,11 +158,14 @@ with st.sidebar:
                     max_depth=max_depth,
                     test_size=test_size / 100,
                 )
-                success, msg = model.train(st.session_state.df)
+                success, msg = model.train(
+                    st.session_state.df,
+                    target_col=selected_target,   # ← explicit target
+                )
                 if success:
                     st.session_state.model = model
                     st.session_state.trained = True
-                    st.success("✅ Model trained!")
+                    st.success(msg)
                 else:
                     st.error(f"Training failed: {msg}")
 
@@ -147,7 +179,6 @@ with st.sidebar:
 
 # ─────────────────────────── Main Content ───────────────────────────
 if st.session_state.df is None:
-    # Welcome screen
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.markdown("""
@@ -209,14 +240,15 @@ else:
         st.markdown('<div class="section-header">📊 Exploratory Data Analysis</div>', unsafe_allow_html=True)
 
         model_obj = st.session_state.model
-        target_col = model_obj.target_col if model_obj else None
-
-        # Auto-detect price column
-        price_candidates = [c for c in df.columns if any(k in c.lower() for k in ["price", "cost", "value", "sell"])]
-        if not price_candidates:
-            price_candidates = df.select_dtypes(include=np.number).columns.tolist()
-
-        target_col = st.selectbox("Select Price (Target) Column", price_candidates, index=0)
+        # Use trained model's target if available, else let user pick
+        if model_obj and model_obj.target_col:
+            target_col = model_obj.target_col
+            st.info(f"Using trained target column: **{target_col}**")
+        else:
+            price_candidates = [c for c in df.columns if any(k in c.lower() for k in ["price", "cost", "value", "sell"])]
+            if not price_candidates:
+                price_candidates = df.select_dtypes(include=np.number).columns.tolist()
+            target_col = st.selectbox("Select Price (Target) Column for EDA", price_candidates, index=0)
 
         tab1, tab2, tab3, tab4 = st.tabs(["📈 Distribution", "🔗 Correlations", "🏷️ Category Analysis", "📅 Year Trends"])
 
@@ -284,7 +316,6 @@ else:
             year_candidates = [c for c in df.columns if "year" in c.lower()]
             if year_candidates:
                 year_col = year_candidates[0]
-                # Ensure target column is numeric (handles currency strings like "₹ 1,95,000")
                 df_plot = df.copy()
                 df_plot[target_col] = (
                     df_plot[target_col].astype(str)
@@ -321,6 +352,11 @@ else:
             model_obj = st.session_state.model
             feature_info = model_obj.feature_info
 
+            # Show what the model was trained on
+            med = model_obj.metrics.get("target_median_lakhs", None)
+            med_str = f" · dataset median ≈ {format_price_inr(med)}" if med else ""
+            st.info(f"🎯 Trained on **'{model_obj.target_col}'**{med_str}")
+
             st.markdown("#### Fill in Car Details")
             input_data = {}
             cols = st.columns(3)
@@ -331,10 +367,10 @@ else:
                     if info["type"] == "categorical":
                         input_data[feat] = st.selectbox(f"**{feat}**", info["options"])
                     elif info["type"] == "numeric":
-                        mn, mx, med = info["min"], info["max"], info["median"]
+                        mn, mx, med_val = info["min"], info["max"], info["median"]
                         input_data[feat] = st.number_input(
                             f"**{feat}**", min_value=float(mn), max_value=float(mx),
-                            value=float(med), step=float(max((mx - mn) / 100, 0.1))
+                            value=float(med_val), step=float(max((mx - mn) / 100, 0.1))
                         )
                 col_idx += 1
 
@@ -356,7 +392,6 @@ else:
                           "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
                 st.session_state.predictions_history.append(record)
 
-                # Feature importance mini-chart
                 fi = model_obj.get_feature_importance()
                 if fi is not None:
                     top_fi = fi.head(8)
@@ -366,7 +401,6 @@ else:
                     fig.update_layout(height=300, yaxis=dict(autorange="reversed"))
                     st.plotly_chart(fig, use_container_width=True)
 
-                # Export options
                 st.markdown("#### 📥 Export Prediction")
                 exp_col1, exp_col2 = st.columns(2)
                 with exp_col1:
@@ -378,7 +412,6 @@ else:
                     st.download_button("⬇️ Download PDF Report", pdf_bytes, "prediction_report.pdf",
                                        "application/pdf", use_container_width=True)
 
-            # Prediction History
             if st.session_state.predictions_history:
                 st.markdown("#### 🕒 Prediction History")
                 hist_df = pd.DataFrame(st.session_state.predictions_history)
@@ -399,15 +432,14 @@ else:
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("R² Score (Train)", f"{metrics['train_r2']:.4f}")
-            col2.metric("R² Score (Test)", f"{metrics['test_r2']:.4f}")
-            col3.metric("RMSE", f"{metrics['rmse']:.4f}")
-            col4.metric("MAE", f"{metrics['mae']:.4f}")
+            col2.metric("R² Score (Test)",  f"{metrics['test_r2']:.4f}")
+            col3.metric("RMSE (Lakhs)",     f"{metrics['rmse']:.4f}")
+            col4.metric("MAE (Lakhs)",      f"{metrics['mae']:.4f}")
 
             col_left, col_right = st.columns(2)
             with col_left:
-                # Actual vs Predicted
                 fig = px.scatter(x=model_obj.y_test, y=model_obj.y_pred,
-                                 labels={"x": "Actual Price", "y": "Predicted Price"},
+                                 labels={"x": "Actual Price (L)", "y": "Predicted Price (L)"},
                                  title="Actual vs Predicted Price",
                                  color_discrete_sequence=["#667eea"], opacity=0.6)
                 mn_val = min(model_obj.y_test.min(), model_obj.y_pred.min())
@@ -418,15 +450,13 @@ else:
                 st.plotly_chart(fig, use_container_width=True)
 
             with col_right:
-                # Residual plot
                 residuals = np.array(model_obj.y_test) - np.array(model_obj.y_pred)
                 fig2 = px.scatter(x=model_obj.y_pred, y=residuals,
-                                  labels={"x": "Predicted Price", "y": "Residuals"},
+                                  labels={"x": "Predicted Price (L)", "y": "Residuals"},
                                   title="Residual Plot", color_discrete_sequence=["#764ba2"], opacity=0.6)
                 fig2.add_hline(y=0, line_dash="dash", line_color="#667eea")
                 st.plotly_chart(fig2, use_container_width=True)
 
-            # Feature Importance
             fi = model_obj.get_feature_importance()
             if fi is not None:
                 fig3 = px.bar(fi, x="Importance", y="Feature", orientation="h",
@@ -435,7 +465,6 @@ else:
                 fig3.update_layout(yaxis=dict(autorange="reversed"), height=max(300, len(fi) * 28))
                 st.plotly_chart(fig3, use_container_width=True)
 
-            # Error distribution
             residuals_df = pd.DataFrame({"Residuals": residuals})
             fig4 = px.histogram(residuals_df, x="Residuals", nbins=40,
                                 title="Error Distribution", color_discrete_sequence=["#667eea"])
